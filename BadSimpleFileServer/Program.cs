@@ -1,195 +1,267 @@
 ﻿// See https://aka.ms/new-console-template for more information
+using System;
 using System.Net;
 using System.Net.Sockets;
 
-Console.WriteLine("Hello, World!");
+object mLock = new();
+//string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\test.data";
+string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\100meg.test";
+
+Console.WriteLine("Listening on 127.0.0.1:40808!");
+Console.WriteLine($"Serves a single file from \"{ fileName}\"");
+Console.WriteLine("Commands:");
+Console.WriteLine("d - disconnect open connection");
+Console.WriteLine("q - quit");
 
 //Server.SimpleHttpListenerExample("http://localhost:40808/");
 
-Server.TcpListenerExample("127.0.0.1", 40808);
+using var ctsApp = new CancellationTokenSource();
+bool toBeDisconnected = false;
+Task.Run(() => TcpListenerExample("127.0.0.1", 40808, ctsApp.Token));
 
-public class Server
+while (true)
 {
-    public static void TcpListenerExample(string host, int port)
+    Console.WriteLine("Waiting for input:");
+    var consoleKeyInfo = Console.ReadKey();
+    var upperChar = char.ToUpper(consoleKeyInfo.KeyChar);
+    Console.WriteLine($"Got: '{upperChar}'");
+    switch (upperChar)
     {
-        TcpListener server = null!;
-        try
-        {
-            // Set the TcpListener on port 13000.
-            IPAddress localAddr = IPAddress.Parse(host);
-
-            // TcpListener server = new TcpListener(port);
-            server = new TcpListener(localAddr, port);
-
-            // Start listening for client requests.
-            server.Start();
-
-            // Buffer for reading data
-            Byte[] bytes = new Byte[1024];
-            String data = null!;
-
-            // Enter the listening loop.
-            while (true)
+        case 'D':
+            Console.WriteLine();
+            lock (mLock)
             {
-                Console.Write("Waiting for a connection... ");
+                Console.WriteLine("Disconnect requested");
+                toBeDisconnected = true;
+            }
+            break;
+        case 'Q':
+            Console.WriteLine();
+            Console.WriteLine("Quit requested");
+            ctsApp.Cancel();
+            Environment.Exit(0);
+            break;
+    }
+}
 
-                // Perform a blocking call to accept requests.
-                // You could also use server.AcceptSocket() here.
-                using TcpClient client = server.AcceptTcpClient();
+
+void TcpListenerExample(string host, int port, CancellationToken appCancellationToken)
+{
+    TcpListener server = null!;
+    try
+    {
+        // Set the TcpListener on port 13000.
+        IPAddress localAddr = IPAddress.Parse(host);
+
+        // TcpListener server = new TcpListener(port);
+        server = new TcpListener(localAddr, port);
+
+        // Start listening for client requests.
+        server.Start();
+
+        // Buffer for reading data
+        Byte[] bytes = new Byte[1024];
+        String data = null!;
+
+        // Enter the listening loop.
+        while (true && !appCancellationToken.IsCancellationRequested)
+        {
+            Console.Write("Waiting for a connection... ");
+
+            // Perform a blocking call to accept requests.
+            // You could also use server.AcceptSocket() here.
+            using TcpClient client = server.AcceptTcpClient();
+
+            try
+            {
                 Console.WriteLine("Connected!");
 
                 data = null!;
 
                 // Get a stream object for reading and writing
-                NetworkStream stream = client.GetStream();
+                using NetworkStream stream = client.GetStream();
+                using var fileStream = File.OpenRead(fileName);
 
-                int i;
+                FileInfo fi = new FileInfo(fileName);
 
-                // Loop to receive all the data sent by the client.
-                while ((i = stream.Read(bytes, 0, bytes.Length)) != 0)
+                if (fi.Length == 0)
+                    throw new IOException($"File {fileName} has no content");
+
+                int bytesReadFromClient;
+                toBeDisconnected = false;
+
+                // Loop to receive all the data sent by the client. For this Http client we'll just do it once 
+                while (!toBeDisconnected && (bytesReadFromClient = stream.Read(bytes, 0, bytes.Length)) != 0 && !appCancellationToken.IsCancellationRequested)
                 {
+                    // Parse the request
+
                     // Translate data bytes to a ASCII string.
-                    data = System.Text.Encoding.ASCII.GetString(bytes, 0, i);
-                    Console.WriteLine("Received: {0}", data);
+                    data = System.Text.Encoding.ASCII.GetString(bytes, 0, bytesReadFromClient);
 
-                    // Process the data sent by the client.
-                    data = data.ToUpper();
+                    if (bytesReadFromClient == bytes.Length)
+                    {
+                        throw new IOException($"This server can only handle requests of {bytes.Length} bytes or less.");
+                    }
+                    //Console.WriteLine("Received: {0}", data);
 
-                    byte[] msg = System.Text.Encoding.ASCII.GetBytes(data);
 
-                    // Send back a response.
-                    //stream.Write(msg, 0, msg.Length);
+                    bool isRange = false;
+                    long from = long.MaxValue;
+                    long? to = null;
+                    
+                    string[] lines = data.Split("\r\n");
+                    if (lines.Length == 0)
+                    {
+                        Console.WriteLine("Didn't get any lines - not a valid HTTP request: {0}", data);
+                        continue;
+                    }
 
-                    string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\test.data";
-                    FileInfo fi = new FileInfo(fileName);
+                    Console.WriteLine("Received request: {0}", lines[0]); // not doing a sophisticated HTTP quest tpye check
+                    for (int j = 1; j < lines.Length; j++)
+                    {
+                        if (lines[j].Length == 0)
+                            break;
+
+                        string[] headers = lines[j].Split(":");
+                        if (headers.Length == 2)
+                        {
+                            if (headers[0] == "Range")
+                            {
+                                string[] ranges = headers[1].Split(new string[] { "=", "-", ",", ", ", " " }, StringSplitOptions.RemoveEmptyEntries);
+                                if (ranges.Length == 2 || ranges.Length == 3)
+                                {
+                                    if (ranges[0] == "bytes")
+                                    {
+                                        from = Convert.ToInt64(ranges[1]);
+                                        if (ranges.Length > 2)
+                                        {
+                                            to = Convert.ToInt64(ranges[2]);
+                                        }
+                                        isRange = true;
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"Non-byte or multi-byte ranges (${lines[j]}) are not supported. Returning full content");
+                                    }
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"Non-byte or multi-byte ranges (${lines[j]}) are not supported. Returning full content");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Skipping header {headers[0]}: {headers[1]}");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Skipping header {headers[0]}: {headers[1]}");
+                        }
+                    }
+
                     // Construct a response.
-                    using var fileStream = File.OpenRead(fileName);
                     byte[] buffer = new byte[1024];
-                    long totalBytes = 0;
-                    //s.ContentLength64 = fi.Length;
-                    // TODO need to write raw HTTP prefix before body
-                    //                    string topstuff = @$"""
-                    //HTTP/1.1 200 OK
-                    //Content-Type: application/octet-stream
-                    //Last-Modified: Sun, 17 Apr 2022 03:32:06 GMT
-                    //Accept-Ranges: bytes
-                    //ETag: ""374b9ab6b52d81:0""
-                    //Server: Microsoft-IIS/10.0
-                    //X-Powered-By: ASP.NET
-                    //Date: Wed, 27 Apr 2022 10:45:49 GMT
-                    //Content-Length: {fi.Length}
+                    long totalBytesSent = 0;
+                    long contentLength;
 
-                    //""";
-                    string topstuff = $"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {fi.Length}\r\n\r\n";
+                    // need to write raw HTTP prefix before body
+                    // e.g.
+                    // HTTP/1.1 200 OK
+                    // Content-Type: application/octet-stream
+                    // Last-Modified: Sun, 17 Apr 2022 03:32:06 GMT
+                    // Accept-Ranges: bytes
+                    // ETag: ""374b9ab6b52d81:0""
+                    // Server: Microsoft-IIS/10.0
+                    // X-Powered-By: ASP.NET
+                    // Date: Wed, 27 Apr 2022 10:45:49 GMT
+                    // Content-Length: {fi.Length}
+                    // <blank-line>
+                    // <response-body>
+                    string topstuff = $"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n";
+                    if (isRange)
+                    {
+                        if (to == null)
+                        {
+                            contentLength = fi.Length - from;
+                            to = fi.Length - 1;
+                        }
+                        else
+                        {
+                            contentLength = to.Value - from + 1;
+                        }
+                        fileStream.Position = from;
+                        topstuff += $"Content-Length: {contentLength}\r\nContent-Range: bytes {from}-{to}/{fi.Length}\r\n\r\n";
+                    }
+                    else
+                    {
+                        contentLength = fi.Length;
+                        topstuff += $"Content-Length: {contentLength}\r\n\r\n";
+                    }
+
+                    // TODO return 4xx if range doesn't fit within fi.Length
+
                     byte[] headerBuffer = System.Text.Encoding.UTF8.GetBytes(topstuff);
                     stream.Write(headerBuffer, 0, headerBuffer.Length);
 
                     try
                     {
-                        while (true)
+                        Console.WriteLine();
+                        while (true && !appCancellationToken.IsCancellationRequested)
                         {
+                            lock (mLock)
+                            {
+                                if (toBeDisconnected)
+                                {
+                                    Console.WriteLine($"\rDisconnected client. Bytes sent {totalBytesSent} of {fi.Length} ({totalBytesSent * 100.0 / fi.Length}%)");
+                                    break;
+                                }
+                            }
                             int bytesRead = fileStream.Read(buffer, 0, buffer.Length);
                             if (bytesRead <= 0)
+                            {
+                                Console.Write($"\rAll {totalBytesSent} bytes sent");
                                 break;
-                            totalBytes += bytesRead;
+                            }
+                            totalBytesSent += bytesRead;
                             stream.Write(buffer, 0, buffer.Length);
-                            Console.WriteLine($"\rBytes sent {totalBytes}");
-
-                            // TODO  - testing deliberately cutting it short
-                            stream.Close();
-                            throw new Exception();
+                            Console.Write($"\rBytes sent {totalBytesSent}");
                         }
-                        //string responseString = "<HTML><BODY> Hello world!</BODY></HTML>";
-                        //  byte[] buffer  = System.Text.Encoding.UTF8.GetBytes(responseString);
-                        // Get a response stream and write the response to it.
-                        // You must close the output stream.
-                        stream.Close();
+
+                        if (contentLength == totalBytesSent)
+                        {
+                            Console.Write($"\rAll {totalBytesSent} bytes sent");
+                            Console.WriteLine();
+                            break;
+                        }
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        Console.ReadLine();
+                        Console.WriteLine(ex);
                     }
-
-                    //listener.Stop();
-                    //Console.WriteLine("Sent: {0}", data);
                 }
-
+            }
+            catch (IOException ex)
+            {
+                Console.WriteLine(ex);
+            }
+            finally
+            {
                 // Shutdown and end the connection
                 client.Close();
             }
         }
-        catch (SocketException e)
-        {
-            Console.WriteLine("SocketException: {0}", e);
-                        Console.ReadLine();
-        }
-        finally
-        {
-            server.Stop();
-        }
-
-        Console.WriteLine("\nHit enter to continue...");
-        Console.Read();
     }
-    // This example requires the System and System.Net namespaces.
-    public static void SimpleHttpListenerExample(params string[] prefixes)
+    catch (SocketException e)
     {
-        if (!HttpListener.IsSupported)
-        {
-            Console.WriteLine("Windows XP SP2 or Server 2003 is required to use the HttpListener class.");
-            return;
-        }
-        // URI prefixes are required,
-        // for example "http://localhost:40808/".
-        if (prefixes == null || prefixes.Length == 0)
-            throw new ArgumentException("prefixes");
-
-        // Create a listener.
-        HttpListener listener = new HttpListener();
-        // Add the prefixes.
-        foreach (string s in prefixes)
-        {
-            listener.Prefixes.Add(s);
-        }
-        listener.Start();
-        Console.WriteLine("Listening...");
-        // Note: The GetContext method blocks while waiting for a request.
-        HttpListenerContext context = listener.GetContext();
-        HttpListenerRequest request = context.Request;
-        // Obtain a response object.
-        HttpListenerResponse response = context.Response;
-        string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\test.data";
-        FileInfo fi = new FileInfo(fileName);
-        // Construct a response.
-        using var fileStream = File.OpenRead(fileName);
-        byte[] buffer = new byte[1024];
-        long totalBytes = 0;
-        Stream output = response.OutputStream;
-        response.ContentLength64 = fi.Length;
-        try
-        { 
-        while (true)
-        {
-            int bytesRead = fileStream.Read(buffer, 0, buffer.Length);
-            if (bytesRead <= 0)
-                break;
-            totalBytes += bytesRead;
-            output.Write(buffer, 0, buffer.Length);
-            Console.WriteLine($"\rBytes sent {totalBytes}");
-
-            // TODO  - testing deliberately cutting it short
-            throw new Exception("Test");
-        }
-        //string responseString = "<HTML><BODY> Hello world!</BODY></HTML>";
-        //  byte[] buffer  = System.Text.Encoding.UTF8.GetBytes(responseString);
-        // Get a response stream and write the response to it.
-        // You must close the output stream.
-        output.Close();
-        }
-        catch {
-            Console.ReadLine();
-        }
-
-        listener.Stop();
+        Console.WriteLine("SocketException: {0}", e);
     }
+    finally
+    {
+        server.Stop();
+    }
+
+    Console.WriteLine("\nHit enter to continue...");
+    Console.Read();
 }
+
