@@ -5,10 +5,11 @@ using System.Net.Sockets;
 
 object mLock = new();
 //string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\test.data";
-string fileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\100meg.test";
+string testFileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\100meg.test";
+string gzFileName = Environment.ExpandEnvironmentVariables("%TEMP%") + "\\100meg.test.gz";
 
 Console.WriteLine("Listening on 127.0.0.1:40808!");
-Console.WriteLine($"Serves a single file from \"{ fileName}\"");
+Console.WriteLine($"Serves a single file from \"{testFileName}\" or a gzip compressed");
 Console.WriteLine("Commands:");
 Console.WriteLine("d - disconnect open connection");
 Console.WriteLine("q - quit");
@@ -80,12 +81,8 @@ void TcpListenerExample(string host, int port, CancellationToken appCancellation
 
                 // Get a stream object for reading and writing
                 using NetworkStream stream = client.GetStream();
-                using var fileStream = File.OpenRead(fileName);
-
-                FileInfo fi = new FileInfo(fileName);
-
-                if (fi.Length == 0)
-                    throw new IOException($"File {fileName} has no content");
+                using var testFileStream = File.OpenRead(testFileName);
+                using var gzFileStream = File.OpenRead(gzFileName);
 
                 int bytesReadFromClient;
                 toBeDisconnected = false;
@@ -115,6 +112,24 @@ void TcpListenerExample(string host, int port, CancellationToken appCancellation
                         Console.WriteLine("Didn't get any lines - not a valid HTTP request: {0}", data);
                         continue;
                     }
+
+                    string[] startLineParts = lines[0].Split(' ');
+
+                    FileStream fileStream;
+                    FileInfo fi;
+                    if (startLineParts.Length != 3 || !startLineParts[1].EndsWith("gz"))
+                    {
+                        fileStream = testFileStream;
+                        fi = new FileInfo(testFileName);
+                    }
+                    else
+                    {
+                        fileStream = gzFileStream;
+                        fi = new FileInfo(gzFileName);
+                    }
+
+                    if (fi.Length == 0)
+                        throw new IOException($"File {fi.FullName} has no content");
 
                     Console.WriteLine("Received request: {0}", lines[0]); // not doing a sophisticated HTTP quest tpye check
                     for (int j = 1; j < lines.Length; j++)
